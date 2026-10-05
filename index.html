@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conv2D GPU Lab</title>
+<style>
+:root{--bg:#0b0e14;--pn:#121722ee;--ac:#00e5ff;--gr:#39ff88;--ye:#ffd23f;--rd:#ff4d5e;--tx:#cfd8e6}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);
+font:13px/1.4 ui-monospace,Consolas,monospace;overflow:hidden}
+#stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+canvas{display:block;cursor:ew-resize;box-shadow:0 0 40px #000}
+#pn{position:fixed;top:0;right:0;bottom:0;width:320px;padding:14px;overflow:auto;background:var(--pn);
+backdrop-filter:blur(8px);border-left:1px solid #26304a;transition:transform .25s}
+body.hide #pn{transform:translateX(100%)}
+#tg{position:fixed;top:10px;right:10px;z-index:5;background:#121722;color:var(--ac);border:1px solid var(--ac);
+border-radius:6px;padding:4px 10px;cursor:pointer;font:inherit}
+body:not(.hide) #tg{right:330px}
+h1{margin:0 0 8px;font-size:16px;color:var(--ac)}h1 small{color:var(--gr)}
+h2{margin:14px 0 6px;font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:var(--gr)}
+button,select,input[type=file]{background:#1a2133;color:var(--tx);border:1px solid #2c3858;border-radius:5px;
+padding:4px 8px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--ac)}button.on{background:var(--ac);color:#000}
+#pre{display:flex;flex-wrap:wrap;gap:4px}
+#kg{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:8px 0}
+#kg input{width:100%;padding:8px 4px;text-align:center;background:#0b0e14;color:var(--ac);
+border:1px solid #2c3858;border-radius:4px;font:15px ui-monospace,Consolas,monospace}
+#sum{padding:8px;border-radius:6px;border:1px solid;margin-bottom:6px;font-size:14px}
+#sum.g{color:var(--gr);background:#39ff8818}#sum.y{color:var(--ye);background:#ffd23f18}
+#sum.r{color:var(--rd);background:#ff4d5e22}#sum.n{color:var(--tx);background:#ffffff0c}
+input[type=range]{width:100%;accent-color:var(--ac)}
+.bars i{display:block;height:12px;border:1px solid #2c3858;margin:2px 0}
+.bars span,.n{font-size:11px;color:#8b98b0}.bars{margin:6px 0}
+#st{background:#0b0e14;border:1px solid #2c3858;border-radius:6px;padding:8px;margin-top:6px}
+#st b{color:var(--ac)}label{display:block;margin:4px 0}
+</style></head><body>
+<div id="stage"><canvas id="c"></canvas></div>
+<button id="tg" title="Mostrar/ocultar panel (tecla H)">☰</button>
+<aside id="pn">
+<h1>CONV2D<small> // GPU LAB</small></h1>
+<input type="file" id="f" accept="image/*">
+<h2>Kernel 3×3</h2><div id="pre"></div><div id="kg"></div>
+<div id="sum"></div><button id="nm">Normalizar (÷ ΣK)</button>
+<h2>Bias DC</h2>
+<label><input type="checkbox" id="bias"> Añadir bias 0.5 (gris neutro para filtros con ΣK=0)</label>
+<div class="bars"><span>sin bias · señal −1…+1</span>
+<i style="background:linear-gradient(90deg,#000 50%,#fff)"></i><span>con bias +0.5</span>
+<i style="background:linear-gradient(90deg,#000,#fff)"></i><span>−1 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 0 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; +1</span></div>
+<p class="n">El framebuffer solo guarda [0,1]: todo valor negativo se recorta a negro. Sumar 0.5 mueve el cero
+a gris medio y deja ver bordes positivos (claros) y negativos (oscuros).</p>
+<h2>Comparación A/B</h2>
+<label><input type="checkbox" id="sp" checked> Cortina (izq: original · der: filtrada)</label>
+<input type="range" id="sx" min="0" max="1" step="0.001" value="0.5">
+<h2>Separabilidad</h2>
+<select id="md"><option value="k">Kernel 3×3 editable</option>
+<option value="d">Gaussiano N×N directo</option><option value="s">Gaussiano separable 2 pases</option></select>
+<select id="nn"><option>3</option><option>5</option><option>7</option><option selected>9</option></select> N
+<label>Carga ×<span id="lv">1</span> (repite el filtro para medir)
+<input type="range" id="ld" min="1" max="30" value="1"></label>
+<div id="st"></div>
+</aside>
+<script>
+//@@ Shaders
+const VS=`attribute vec2 p;varying vec2 v;void main(){v=p*.5+.5;gl_Position=vec4(p,0.,1.);}`;
+const HD='precision highp float;varying vec2 v;uniform sampler2D t;uniform vec2 px;\n';
+const FK=HD+`uniform float k[9];uniform float bias;uniform int sob;
+float L(vec3 c){return dot(c,vec3(.299,.587,.114));}
+void main(){
+ vec3 s=vec3(0.);float gx=0.,gy=0.;
+ for(int i=0;i<9;i++){
+  float ox=float(i-(i/3)*3)-1.,oy=1.-float(i/3);
+  vec3 c=texture2D(t,v+vec2(ox,oy)*px).rgb;
+  s+=k[i]*c;
+  float l=L(c);gx+=l*ox*(2.-abs(oy));gy+=l*oy*(2.-abs(ox));
+ }
+ gl_FragColor=vec4(sob==1?vec3(sqrt(gx*gx+gy*gy)):s+bias,1.);
+}`;
+const FG=HD+`uniform vec2 dir;uniform vec2 g;uniform int R,direct;
+float w(int i){return exp(-float(i*i)*g.x)*g.y;}
+void main(){vec3 s=vec3(0.);
+ if(direct==1){for(int j=-4;j<=4;j++){if(j<-R||j>R)continue;
+  for(int i=-4;i<=4;i++){if(i<-R||i>R)continue;
+   s+=w(i)*w(j)*texture2D(t,v+vec2(i,j)*px).rgb;}}}
+ else{for(int i=-4;i<=4;i++){if(i<-R||i>R)continue;
+   s+=w(i)*texture2D(t,v+float(i)*dir*px).rgb;}}
+ gl_FragColor=vec4(s,1.);}`;
+const FC=`precision highp float;varying vec2 v;uniform sampler2D a,b;uniform float sp,lw;
+void main(){vec3 c=v.x<sp?texture2D(a,v).rgb:texture2D(b,v).rgb;
+ if(abs(v.x-sp)<lw)c=vec3(0.,.9,1.);gl_FragColor=vec4(c,1.);}`;
+
+//@@ Utilidades WebGL
+const $=s=>document.querySelector(s);
+const gl=$('#c').getContext('webgl');
+if(!gl)document.body.innerHTML='<h1>Tu navegador no soporta WebGL</h1>';
+function mk(fs,names){
+ const sh=(ty,src)=>{const o=gl.createShader(ty);gl.shaderSource(o,src);gl.compileShader(o);
+  if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(o);return o};
+ const p=gl.createProgram();
+ gl.attachShader(p,sh(gl.VERTEX_SHADER,VS));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));
+ gl.bindAttribLocation(p,0,'p');gl.linkProgram(p);
+ const u={};names.forEach(n=>u[n]=gl.getUniformLocation(p,n));return{p,u};}
+function tex(w,h,s){
+ const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+ [[gl.TEXTURE_MIN_FILTER,gl.NEAREST],[gl.TEXTURE_MAG_FILTER,gl.NEAREST],
+  [gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE]]
+  .forEach(a=>gl.texParameteri(gl.TEXTURE_2D,a[0],a[1]));
+ if(s)gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,s);
+ else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+ return t;}
+function fbo(w,h){
+ const t=tex(w,h),f=gl.createFramebuffer();
+ gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+ gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+ return{f,t};}
+gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+const PK=mk(FK,['t','px','k[0]','bias','sob']);
+const PG=mk(FG,['t','px','dir','g','R','direct']);
+const PC=mk(FC,['a','b','sp','lw']);
+
+//@@ Imagen procedural y carga
+let W=1,H=1,T,A,B;
+function proc(){
+ const c=document.createElement('canvas');c.width=768;c.height=512;const x=c.getContext('2d');
+ const g=x.createLinearGradient(0,0,768,0);g.addColorStop(0,'#1b2a49');g.addColorStop(1,'#e8b04a');
+ x.fillStyle=g;x.fillRect(0,0,768,512);
+ x.fillStyle='#fff';x.beginPath();x.arc(150,140,90,0,7);x.fill();
+ x.fillStyle='#d33';x.fillRect(260,60,140,140);
+ for(let i=0;i<8;i++)for(let j=0;j<8;j++){x.fillStyle=(i+j)%2?'#000':'#fff';x.fillRect(450+i*20,60+j*20,20,20);}
+ const d=x.getImageData(40,300,200,160);
+ for(let i=0;i<d.data.length;i+=4){d.data[i]=d.data[i+1]=d.data[i+2]=Math.random()*255;}
+ x.putImageData(d,40,300);
+ for(let i=0;i<280;i++){const f=(Math.sin(i*i/900)*.5+.5)*255|0;x.fillStyle=`rgb(${f},${f},${f})`;x.fillRect(270+i,300,1,70);}
+ x.strokeStyle='#fff';
+ for(let i=0;i<12;i++){x.beginPath();x.moveTo(270,390+i*4);x.lineTo(550,470);x.stroke();}
+ x.fillStyle='#fff';x.font='bold 56px monospace';x.fillText('GPU 2D',560,430);
+ x.font='12px monospace';x.fillText('Convolution · f*h',560,455);
+ return c;}
+function fit(){
+ const s=Math.min(innerWidth/W,innerHeight/H);
+ $('#c').style.width=W*s+'px';$('#c').style.height=H*s+'px';}
+function setSource(im){
+ let w=im.width,h=im.height;const s=Math.min(1,1024/Math.max(w,h));
+ w=Math.round(w*s);h=Math.round(h*s);
+ const c=document.createElement('canvas');c.width=W=w;c.height=H=h;
+ c.getContext('2d').drawImage(im,0,0,w,h);
+ gl.canvas.width=w;gl.canvas.height=h;
+ T=tex(w,h,c);A=fbo(w,h);B=fbo(w,h);fit();}
+$('#f').onchange=e=>{const f=e.target.files[0];if(!f)return;
+ const im=new Image();im.onload=()=>setSource(im);im.src=URL.createObjectURL(f);};
+addEventListener('resize',fit);
+
+//@@ Kernels y editor
+const PRE={
+ 'Original':[[0,0,0,0,1,0,0,0,0]],
+ 'Box Blur':[Array(9).fill(1/9)],
+ 'Gaussian':[[1,2,1,2,4,2,1,2,1].map(x=>x/16)],
+ 'Laplacian':[[0,-1,0,-1,4,-1,0,-1,0]],
+ 'High-Pass 8':[[-1,-1,-1,-1,8,-1,-1,-1,-1]],
+ 'Sobel |∇|':[[-1,0,1,-2,0,2,-1,0,1],1],
+ 'Sharpen':[[0,-1,0,-1,5,-1,0,-1,0]]};
+let K=[],sob=0,mode='k',N=9,rep=1;
+const ins=[],bt={};
+function act(n){for(const k in bt)bt[k].classList.toggle('on',k===n);}
+function updSum(){
+ const s=K.reduce((a,b)=>a+b,0);let c='n',m='ganancia DC intermedia';
+ if(s>1.2||s<-.2){c='r';m=s>1.2?'⚠ riesgo de quemar la señal (sobreexposición)':'⚠ ΣK &lt; −0.2: señal invertida/oscura';}
+ else if(Math.abs(s-1)<.05){c='g';m='DC preservado (energía conservada)';}
+ else if(Math.abs(s)<.05){c='y';m='paso alto puro (ΣK≈0)';}
+ $('#sum').className=c;$('#sum').innerHTML='ΣK = <b>'+s.toFixed(3)+'</b><br><small>'+m+'</small>';}
+function setK(a){K=a.slice();ins.forEach((e,i)=>e.value=+K[i].toFixed(4));updSum();}
+for(let i=0;i<9;i++){
+ const e=document.createElement('input');e.type='number';e.step='0.01';
+ e.oninput=()=>{K[i]=parseFloat(e.value)||0;sob=0;act(null);updSum();};
+ $('#kg').appendChild(e);ins.push(e);}
+for(const n in PRE){
+ const b=document.createElement('button');b.textContent=n;
+ b.onclick=()=>{sob=PRE[n][1]||0;setK(PRE[n][0]);act(n);};
+ $('#pre').appendChild(b);bt[n]=b;}
+$('#nm').onclick=()=>{const s=K.reduce((a,b)=>a+b,0);
+ if(Math.abs(s)<1e-6){alert('ΣK≈0: no se puede normalizar (división por cero).');return;}
+ sob=0;act(null);setK(K.map(x=>x/s));};
+
+//@@ Pipeline de render
+function draw(P,tx,fb,fn){
+ gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.viewport(0,0,W,H);gl.useProgram(P.p);
+ gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tx);
+ gl.uniform1i(P.u.t,0);gl.uniform2f(P.u.px,1/W,1/H);fn(P.u);
+ gl.drawArrays(gl.TRIANGLE_STRIP,0,4);}
+let ms=0;
+function render(){
+ const t0=performance.now(),R=(N-1)/2,sg=Math.max(.7,N/4),i2=1/(2*sg*sg);
+ let Z=0;for(let i=-R;i<=R;i++)Z+=Math.exp(-i*i*i2);
+ const gset=(u,d,dr)=>{gl.uniform2f(u.dir,d[0],d[1]);gl.uniform2f(u.g,i2,1/Z);
+  gl.uniform1i(u.R,R);gl.uniform1i(u.direct,dr);};
+ const bias=$('#bias').checked?.5:0;
+ for(let r=0;r<rep;r++){
+  if(mode==='k')draw(PK,T,B.f,u=>{gl.uniform1fv(u['k[0]'],K);gl.uniform1f(u.bias,bias);gl.uniform1i(u.sob,sob);});
+  else if(mode==='d')draw(PG,T,B.f,u=>gset(u,[1,0],1));
+  else{draw(PG,T,A.f,u=>gset(u,[1,0],0));draw(PG,A.t,B.f,u=>gset(u,[0,1],0));}
+ }
+ draw(PC,T,null,u=>{
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,B.t);
+  gl.uniform1i(u.a,0);gl.uniform1i(u.b,1);
+  gl.uniform1f(u.sp,$('#sp').checked?+$('#sx').value:-1);gl.uniform1f(u.lw,1.5/W);
+  gl.activeTexture(gl.TEXTURE0);});
+ gl.finish();ms=ms*.9+(performance.now()-t0)*.1;}
+let frames=0;
+function loop(){render();frames++;requestAnimationFrame(loop);}
+
+//@@ Interacción y estadísticas
+const cv=$('#c');
+function drag(e){if(!(e.buttons&1)||!$('#sp').checked)return;
+ const r=cv.getBoundingClientRect();
+ $('#sx').value=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));}
+cv.onpointerdown=e=>{cv.setPointerCapture(e.pointerId);drag(e);};
+cv.onpointermove=drag;
+$('#md').onchange=e=>mode=e.target.value;
+$('#nn').onchange=e=>N=+e.target.value;
+$('#ld').oninput=e=>{rep=+e.target.value;$('#lv').textContent=rep;};
+$('#tg').onclick=()=>document.body.classList.toggle('hide');
+addEventListener('keydown',e=>{if(e.key==='h'||e.key==='H')$('#tg').click();});
+setInterval(()=>{
+ const act=mode==='k'?9:mode==='d'?N*N:2*N;
+ $('#st').innerHTML=`Directo N²: <b>${N*N}</b> lect/px<br>Separable 2N: <b>${2*N}</b> lect/px `+
+ `(ahorro ×${(N/2).toFixed(1)})<br>Activo: <b>${act*rep}</b> lect/px/frame<br>`+
+ `FPS: <b>${frames*2}</b> · Render: <b>${ms.toFixed(2)} ms</b>`;frames=0;},500);
+setSource(proc());$('#pre button:nth-child(3)').click();loop();
+</script></body></html>
